@@ -593,6 +593,68 @@ def get_price_history(ticker: str, period: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def get_multi_period_returns(ticker: str) -> dict[str, Optional[float]]:
+    """Calculate comparable market returns from a single five-year history."""
+    history = get_price_history(ticker, "5y")
+    if history.empty or "Close" not in history.columns:
+        return {
+            "one_month_return": None,
+            "ytd_return": None,
+            "one_year_return": None,
+            "three_year_annualized_return": None,
+        }
+
+    close = pd.to_numeric(history["Close"], errors="coerce").dropna()
+    if len(close) < 2:
+        return {
+            "one_month_return": None,
+            "ytd_return": None,
+            "one_year_return": None,
+            "three_year_annualized_return": None,
+        }
+
+    # yfinance may return a timezone-aware index. Removing the timezone makes
+    # date comparisons consistent across tickers and deployed environments.
+    close.index = pd.DatetimeIndex(close.index).tz_localize(None)
+    latest_date = close.index[-1]
+    latest_price = float(close.iloc[-1])
+
+    def return_since(cutoff: pd.Timestamp) -> Optional[float]:
+        available = close.loc[close.index >= cutoff]
+        if available.empty:
+            return None
+        starting_price = float(available.iloc[0])
+        if starting_price == 0:
+            return None
+        return latest_price / starting_price - 1
+
+    one_month_return = return_since(latest_date - pd.DateOffset(months=1))
+    ytd_return = return_since(pd.Timestamp(year=latest_date.year, month=1, day=1))
+    one_year_return = return_since(latest_date - pd.DateOffset(years=1))
+
+    three_year_prices = close.loc[
+        close.index >= latest_date - pd.DateOffset(years=3)
+    ]
+    three_year_annualized_return = None
+    if len(three_year_prices) >= 2:
+        starting_price = float(three_year_prices.iloc[0])
+        elapsed_years = (
+            three_year_prices.index[-1] - three_year_prices.index[0]
+        ).days / 365.25
+        if starting_price > 0 and latest_price > 0 and elapsed_years > 0:
+            three_year_annualized_return = (
+                latest_price / starting_price
+            ) ** (1 / elapsed_years) - 1
+
+    return {
+        "one_month_return": one_month_return,
+        "ytd_return": ytd_return,
+        "one_year_return": one_year_return,
+        "three_year_annualized_return": three_year_annualized_return,
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def get_financial_statements(
     ticker: str,
     frequency: str,
@@ -1085,8 +1147,11 @@ def generate_recommendation(
 
 
 def run_comparison(
-    first_company: Mapping[str, Any],
-    second_company: Mapping[str, Any],
+    companies: Sequence[Mapping[str, Any]],
+    score_map: Mapping[str, Mapping[str, Any]],
+    returns: Mapping[str, Mapping[str, Any]],
+    benchmark_ticker: str,
+    benchmark_returns: Mapping[str, Any],
 ) -> Any:
     function = get_callable(
         "comparison",
@@ -1105,22 +1170,30 @@ def run_comparison(
     return call_compatible(
         function,
         {
-            "company_1": first_company,
-            "company_2": second_company,
-            "first_company": first_company,
-            "second_company": second_company,
-            "data_1": first_company,
-            "data_2": second_company,
+            "companies": list(companies),
+            "company_data": list(companies),
+            "scores": score_map,
+            "score_map": score_map,
+            "returns": returns,
+            "benchmark_ticker": benchmark_ticker,
+            "benchmark_returns": benchmark_returns,
         },
-        positional_attempts=((first_company, second_company),),
+        positional_attempts=(
+            (list(companies),),
+            (
+                list(companies),
+                score_map,
+                returns,
+                benchmark_ticker,
+                benchmark_returns,
+            ),
+        ),
     )
 
 
 def run_ai_comparison(
-    first_company: Mapping[str, Any],
-    second_company: Mapping[str, Any],
-    first_scores: Mapping[str, Any],
-    second_scores: Mapping[str, Any],
+    companies: Sequence[Mapping[str, Any]],
+    comparison_result: Mapping[str, Any],
 ) -> Any:
     function = get_callable(
         "ai_comparison",
@@ -1137,24 +1210,18 @@ def run_ai_comparison(
         )
 
     context = {
-        "company_1": first_company,
-        "company_2": second_company,
-        "first_company": first_company,
-        "second_company": second_company,
-        "data_1": first_company,
-        "data_2": second_company,
-        "first_scores": first_scores,
-        "second_scores": second_scores,
-        "scores_1": first_scores,
-        "scores_2": second_scores,
+        "companies": list(companies),
+        "company_data": list(companies),
+        "comparison_result": comparison_result,
+        "comparison": comparison_result,
     }
 
     return call_compatible(
         function,
         context,
         positional_attempts=(
-            (first_company, second_company),
-            (first_company, second_company, first_scores, second_scores),
+            (list(companies),),
+            (list(companies), comparison_result),
         ),
     )
 
@@ -3681,150 +3748,377 @@ with recommendation_tab:
 # =============================================================================
 
 with comparison_tab:
-    st.header("Company Comparison")
+    st.header("Comparable Company Analysis")
+    st.caption(
+        "Compare two to five peers across valuation, growth, profitability, "
+        "financial strength, and market performance versus a benchmark."
+    )
 
-    comparison_input_1, comparison_input_2 = st.columns(2)
+    peer_input_column, benchmark_input_column = st.columns([3, 1])
+    with peer_input_column:
+        default_peer_text = (
+            "NVDA, AMD, AVGO"
+            if main_ticker in {"NVDA", "AMD", "AVGO"}
+            else f"{main_ticker}, AMD, AVGO"
+        )
+        peer_ticker_text = st.text_input(
+            "Peer tickers",
+            value=default_peer_text,
+            help="Enter 2-5 ticker symbols separated by commas.",
+            key="comparison_peer_tickers",
+        )
 
-    with comparison_input_1:
-        first_ticker = clean_ticker(
+    with benchmark_input_column:
+        benchmark_ticker = clean_ticker(
             st.text_input(
-                "First ticker",
-                value=main_ticker,
-                key="comparison_first_ticker",
+                "Market benchmark",
+                value="SPY",
+                help="Examples: SPY, QQQ, or ^GSPC.",
+                key="comparison_benchmark_ticker",
             )
         )
 
-    with comparison_input_2:
-        second_ticker = clean_ticker(
-            st.text_input(
-                "Second ticker",
-                value="AMD" if main_ticker != "AMD" else "NVDA",
-                key="comparison_second_ticker",
-            )
-        )
+    peer_tickers: list[str] = []
+    for ticker_value in re.split(r"[\s,;]+", peer_ticker_text):
+        ticker = clean_ticker(ticker_value)
+        if ticker and ticker not in peer_tickers:
+            peer_tickers.append(ticker)
 
-    if st.button("Compare Companies", type="primary", key="compare_companies_button"):
-        if not first_ticker or not second_ticker:
-            st.error("Enter both ticker symbols.")
-        elif first_ticker == second_ticker:
-            st.error("Enter two different ticker symbols.")
+    if st.button(
+        "Run Comparable Analysis",
+        type="primary",
+        key="compare_companies_button",
+    ):
+        if len(peer_tickers) < 2:
+            st.error("Enter at least two different company tickers.")
+        elif len(peer_tickers) > 5:
+            st.error("Enter no more than five company tickers.")
+        elif not benchmark_ticker:
+            st.error("Enter a benchmark ticker.")
         else:
             try:
                 with st.spinner(
-                    f"Loading financial data for {first_ticker} and {second_ticker}..."
+                    "Loading peer fundamentals, financial scores, and market returns..."
                 ):
-                    first_company = get_company_data(first_ticker)
-                    second_company = get_company_data(second_ticker)
-
-                    first_scores = calculate_scores(first_company)
-                    second_scores = calculate_scores(second_company)
+                    companies = [get_company_data(ticker) for ticker in peer_tickers]
+                    score_map = {
+                        ticker: calculate_scores(company)
+                        for ticker, company in zip(peer_tickers, companies)
+                    }
+                    return_map = {
+                        ticker: get_multi_period_returns(ticker)
+                        for ticker in peer_tickers
+                    }
+                    benchmark_returns = get_multi_period_returns(benchmark_ticker)
 
                     comparison_result = run_comparison(
-                        first_company,
-                        second_company,
+                        companies,
+                        score_map,
+                        return_map,
+                        benchmark_ticker,
+                        benchmark_returns,
                     )
 
                 st.session_state.comparison_result = comparison_result
                 st.session_state.comparison_companies = {
-                    "first": first_company,
-                    "second": second_company,
-                    "first_scores": first_scores,
-                    "second_scores": second_scores,
+                    "companies": companies,
+                    "score_map": score_map,
+                    "tickers": peer_tickers,
+                    "benchmark_ticker": benchmark_ticker,
                 }
-
-                # Clear the previous AI result when a new pair is compared.
                 st.session_state.ai_comparison_result = None
 
             except Exception as exc:
-                st.error(f"Could not load the financial comparison: {exc}")
+                st.error(f"Could not complete the comparable analysis: {exc}")
 
-    comparison_companies = st.session_state.comparison_companies
+    comparison_state = st.session_state.comparison_companies
+    comparison_result = st.session_state.comparison_result
 
-    if comparison_companies:
-        first_company = comparison_companies["first"]
-        second_company = comparison_companies["second"]
-        first_scores = comparison_companies["first_scores"]
-        second_scores = comparison_companies["second_scores"]
+    current_comparison_ready = (
+        isinstance(comparison_state, Mapping)
+        and isinstance(comparison_result, Mapping)
+        and "companies" in comparison_state
+        and "metrics" in comparison_result
+    )
 
-        first_name = first_present(first_company, "company_name", "name", default=first_ticker)
-        second_name = first_present(second_company, "company_name", "name", default=second_ticker)
+    if current_comparison_ready:
+        companies = comparison_state["companies"]
+        score_map = comparison_state["score_map"]
+        active_tickers = comparison_state["tickers"]
+        active_benchmark = comparison_state["benchmark_ticker"]
 
-        st.subheader(f"{first_name} vs. {second_name}")
-
-        company_columns = st.columns(2)
-        with company_columns[0]:
-            st.markdown(f"### {first_present(first_company, 'ticker', default=first_ticker)}")
-            st.metric(
-                "Overall Score",
-                f"{first_present(first_scores, 'overall', default='N/A')} / 100"
-                if is_number(first_present(first_scores, "overall"))
-                else "N/A",
-            )
-            st.metric("Current Price", format_currency(first_present(first_company, "current_price")))
-            st.metric("Market Cap", format_large_number(first_present(first_company, "market_cap")))
-
-        with company_columns[1]:
-            st.markdown(f"### {first_present(second_company, 'ticker', default=second_ticker)}")
-            st.metric(
-                "Overall Score",
-                f"{first_present(second_scores, 'overall', default='N/A')} / 100"
-                if is_number(first_present(second_scores, "overall"))
-                else "N/A",
-            )
-            st.metric("Current Price", format_currency(first_present(second_company, "current_price")))
-            st.metric("Market Cap", format_large_number(first_present(second_company, "market_cap")))
-
-        raw_comparison_tab, ai_comparison_tab = st.tabs(
-            ("Financial Comparison", "AI Comparison")
-        )
-
-        with raw_comparison_tab:
-            if st.session_state.comparison_result is not None:
-                st.dataframe(
-                    MODULES["comparison"].comparison_to_dataframe(
-                        st.session_state.comparison_result
-                    ),
-                    width="stretch",
+        st.subheader("Peer Group Snapshot")
+        company_columns = st.columns(len(active_tickers))
+        for column, ticker, company in zip(
+            company_columns,
+            active_tickers,
+            companies,
+        ):
+            with column:
+                st.markdown(f"### {ticker}")
+                st.caption(
+                    str(first_present(company, "company_name", "name", default=ticker))
+                )
+                st.metric(
+                    "Financial Score",
+                    f"{score_map.get(ticker, {}).get('overall', 'N/A')} / 100",
+                )
+                st.metric(
+                    "Current Price",
+                    format_currency(first_present(company, "current_price")),
+                )
+                st.metric(
+                    "Market Cap",
+                    format_large_number(first_present(company, "market_cap")),
                 )
 
+        (
+            comp_summary_tab,
+            comp_metrics_tab,
+            comp_valuation_tab,
+            comp_performance_tab,
+            ai_comparison_tab,
+        ) = st.tabs(
+            (
+                "Ranking Summary",
+                "Fundamental Metrics",
+                "Valuation vs Peers",
+                "Market Performance",
+                "AI Analyst Comparison",
+            )
+        )
+
+        with comp_summary_tab:
+            leader_columns = st.columns(5)
+            for column, (label, ticker) in zip(
+                leader_columns,
+                comparison_result.get("leaders", {}).items(),
+            ):
+                with column:
+                    st.metric(label, ticker or "N/A")
+
+            st.markdown("#### Peer-Relative Category Scores")
+            st.caption(
+                "Scores rank each company against this selected peer group. "
+                "They are not absolute investment ratings."
+            )
+            category_score_df = MODULES[
+                "comparison"
+            ].category_scores_to_dataframe(comparison_result)
+            score_columns = [
+                ticker for ticker in active_tickers if ticker in category_score_df.columns
+            ]
+
+            def color_peer_score(value: Any) -> str:
+                if not is_number(value):
+                    return ""
+                if float(value) >= 66:
+                    return "background-color: rgba(34, 197, 94, 0.22)"
+                if float(value) >= 33:
+                    return "background-color: rgba(234, 179, 8, 0.20)"
+                return "background-color: rgba(239, 68, 68, 0.18)"
+
+            category_score_style = category_score_df.style.format(
+                {ticker: "{:.1f}" for ticker in score_columns},
+                na_rep="N/A",
+            ).applymap(color_peer_score, subset=score_columns)
+            st.dataframe(
+                category_score_style,
+                width="stretch",
+                hide_index=True,
+            )
+
+            radar_categories = [
+                "Valuation",
+                "Growth",
+                "Profitability",
+                "Financial Strength",
+                "Market Performance",
+            ]
+            radar_figure = go.Figure()
+            for ticker in active_tickers:
+                radar_values = [
+                    comparison_result.get("category_scores", {})
+                    .get(category, {})
+                    .get(ticker)
+                    or 0
+                    for category in radar_categories
+                ]
+                radar_figure.add_trace(
+                    go.Scatterpolar(
+                        r=radar_values + [radar_values[0]],
+                        theta=radar_categories + [radar_categories[0]],
+                        fill="toself",
+                        name=ticker,
+                        opacity=0.68,
+                    )
+                )
+            radar_figure.update_layout(
+                polar={"radialaxis": {"visible": True, "range": [0, 100]}},
+                margin={"l": 40, "r": 40, "t": 30, "b": 30},
+                height=500,
+            )
+            st.plotly_chart(radar_figure, width="stretch")
+
+        with comp_metrics_tab:
+            metric_categories = (
+                "Valuation",
+                "Growth",
+                "Profitability",
+                "Financial Strength",
+            )
+            metric_tabs = st.tabs(metric_categories)
+            for metric_tab, category in zip(metric_tabs, metric_categories):
+                with metric_tab:
+                    metric_df = MODULES["comparison"].comparison_to_dataframe(
+                        comparison_result,
+                        category=category,
+                        formatted=True,
+                    )
+                    metric_lookup = {
+                        metric.get("label"): metric.get("best_ticker")
+                        for metric in comparison_result.get("metrics", [])
+                        if metric.get("category") == category
+                    }
+
+                    def highlight_best_metric(row: pd.Series) -> list[str]:
+                        styles = [""] * len(row)
+                        best_ticker = metric_lookup.get(row.get("Metric"))
+                        if best_ticker in row.index:
+                            styles[row.index.get_loc(best_ticker)] = (
+                                "background-color: rgba(34, 197, 94, 0.22); "
+                                "font-weight: 600"
+                            )
+                        return styles
+
+                    st.dataframe(
+                        metric_df.style.apply(highlight_best_metric, axis=1),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Green identifies the strongest reported value for each "
+                        "metric within the selected peer group."
+                    )
+
+            full_export_df = MODULES["comparison"].comparison_to_dataframe(
+                comparison_result,
+                formatted=False,
+            )
+            st.download_button(
+                "Download Comparison CSV",
+                data=full_export_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{'_'.join(active_tickers)}_comparable_analysis.csv",
+                mime="text/csv",
+                key="download_comparable_analysis",
+            )
+
+        with comp_valuation_tab:
+            st.markdown("#### Valuation Premium / (Discount) to Peer Median")
+            st.caption(
+                "A negative percentage indicates a discount to the peer median. "
+                "Value Rank 1 is the lowest positive multiple."
+            )
+            valuation_df = MODULES[
+                "comparison"
+            ].valuation_premium_to_median_dataframe(comparison_result)
+            if valuation_df.empty:
+                st.info("No comparable valuation multiples were available.")
+            else:
+                st.dataframe(
+                    valuation_df,
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        with comp_performance_tab:
+            performance_df = MODULES["comparison"].comparison_to_dataframe(
+                comparison_result,
+                category="Market Performance",
+                formatted=True,
+            )
+            st.dataframe(
+                performance_df,
+                width="stretch",
+                hide_index=True,
+            )
+
+            performance_period = st.selectbox(
+                "Normalized price chart period",
+                options=("1y", "3y", "5y"),
+                index=1,
+                key="comparison_performance_period",
+            )
+            performance_figure = go.Figure()
+            for ticker in active_tickers + [active_benchmark]:
+                ticker_history = get_price_history(ticker, performance_period)
+                if ticker_history.empty or "Close" not in ticker_history.columns:
+                    continue
+                close = pd.to_numeric(
+                    ticker_history["Close"],
+                    errors="coerce",
+                ).dropna()
+                if close.empty or float(close.iloc[0]) == 0:
+                    continue
+                normalized = close / float(close.iloc[0]) * 100
+                performance_figure.add_trace(
+                    go.Scatter(
+                        x=normalized.index,
+                        y=normalized.values,
+                        mode="lines",
+                        name=ticker,
+                        line={
+                            "width": 3 if ticker == active_benchmark else 2,
+                            "dash": "dash" if ticker == active_benchmark else "solid",
+                        },
+                    )
+                )
+            performance_figure.update_layout(
+                title=f"Normalized Price Performance (Start = 100) vs {active_benchmark}",
+                xaxis_title="Date",
+                yaxis_title="Indexed Value",
+                hovermode="x unified",
+                height=500,
+                margin={"l": 40, "r": 30, "t": 60, "b": 40},
+            )
+            st.plotly_chart(performance_figure, width="stretch")
+
         with ai_comparison_tab:
+            st.caption(
+                "The AI report uses the calculated peer medians, relative rankings, "
+                "and benchmark returns shown in the other tabs."
+            )
             if st.button(
-                "Generate AI Comparison",
+                "Generate AI Comparable Analysis",
                 type="primary",
                 key="generate_ai_comparison_button",
             ):
                 try:
-                    with st.spinner("Generating AI investment analysis..."):
+                    with st.spinner("Writing the equity-research comparison..."):
                         ai_result = run_ai_comparison(
-                            first_company,
-                            second_company,
-                            first_scores,
-                            second_scores,
+                            companies,
+                            comparison_result,
                         )
-
                     if isinstance(ai_result, str):
                         ai_result = ai_result.strip()
-
-                    if ai_result:
-                        st.session_state.ai_comparison_result = ai_result
-                    else:
-                        st.session_state.ai_comparison_result = (
-                            "The AI comparison completed but returned no written analysis."
-                        )
-
+                    st.session_state.ai_comparison_result = (
+                        ai_result
+                        or "The AI comparison completed but returned no written analysis."
+                    )
                 except Exception as exc:
-                    st.error(f"Could not generate AI comparison: {exc}")
+                    st.error(f"Could not generate the AI comparison: {exc}")
 
             if st.session_state.ai_comparison_result:
-                render_text_result(
-                    st.session_state.ai_comparison_result
-                )
+                render_text_result(st.session_state.ai_comparison_result)
             else:
                 st.info(
-                    "Click **Generate AI Comparison** to create an AI investment analysis."
+                    "Generate the report after reviewing the calculated peer comparison."
                 )
     else:
-        st.info("Enter two tickers and click **Compare Companies**.")
+        st.info(
+            "Enter two to five company tickers and a market benchmark, then run "
+            "the comparable analysis."
+        )
 
 
 # =============================================================================
