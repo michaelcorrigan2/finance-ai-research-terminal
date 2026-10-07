@@ -3921,7 +3921,7 @@ with comparison_tab:
             category_score_style = category_score_df.style.format(
                 {ticker: "{:.1f}" for ticker in score_columns},
                 na_rep="N/A",
-            ).applymap(color_peer_score, subset=score_columns)
+            ).map(color_peer_score, subset=score_columns)
             st.dataframe(
                 category_score_style,
                 width="stretch",
